@@ -10,12 +10,20 @@ module riscvmulti (
 
     logic [31:0] instr, PC = 0;
 
-    wire writeBackEn = // Quando se escreve no banco de registradores?
-    wire [31:0] writeBackData = // O que se escreve no banco de registradores?
-    wire [31:0] LoadStoreAddress = // Como se calcula o endereço de memória para loads e stores?
-    assign Address = // Qual o endereço de memória a ser acessado? Alternar entre .text e .data dependendo do estado
-    assign MemWrite = // Em que estado se escreve na memória?
-    assign WriteData = // O que se escreve na memória?
+    wire writeBackEn = (state == EXECUTE  && (isALUreg | isALUimm | isJAL | isJALR | isAUIPC | isLUI))
+                        || (state == WAIT_DATA && isLoad);
+
+    wire [31:0] writeBackData = isLoad ? loadDataFinal : isJAL ? PCplus4 : isJALR ? PCplus4 : isLUI ? Uimm : isAUIPC ? PCTarget : ALUResult;
+
+    wire [31:0] LoadStoreAddress =  isLoad ? (rs1 + Iimm) : (rs1 + Simm);
+
+    assign Address = (state == FETCH_INSTR || state == WAIT_INSTR) ? PC : LoadStoreAddress;
+
+    assign MemWrite = (state == STORE);
+
+    assign WriteData =  (funct3[1:0] == 2'b00) ? shifted_byte : // store byte
+                        (funct3[1:0] == 2'b01) ? shifted_half : // store half-wotd
+                                                 rs2;            // store word
 
     // The 10 RISC-V instructions
     wire isALUreg  =  (instr[6:0] == 7'b0110011); // rd <- rs1 OP rs2   
@@ -123,8 +131,7 @@ module riscvmulti (
     wire [31:0] PCNext = ((isBranch && takeBranch) || isJAL) ? PCTarget :
                                                       isJALR ? {aluPlus[31:1],1'b0} :
                                                                PCplus4;
-
-
+    
     // The state machine
     localparam FETCH_INSTR = 0;
     localparam WAIT_INSTR  = 1;
@@ -135,13 +142,52 @@ module riscvmulti (
     localparam STORE       = 6;
     reg [2:0] state = FETCH_INSTR;
 
+    wire [7:0] rd_byte0 = ReadData[7:0];
+    wire [7:0] rd_byte1 = ReadData[15:8];
+    wire [7:0] rd_byte2 = ReadData[23:16];
+    wire [7:0] rd_byte3 = ReadData[31:24];
+
+    // L/S para byte
+    wire [7:0] selected_byte = (LoadStoreAddress[1:0] == 2'b00) ? rd_byte0 :
+                               (LoadStoreAddress[1:0] == 2'b01) ? rd_byte1 :
+                               (LoadStoreAddress[1:0] == 2'b10) ? rd_byte2 :
+                                                                  rd_byte3 ;
+
+    // L/S para HalfWord
+    wire [15:0] selected_half = LoadStoreAddress[1] ? ReadData[31:16] : ReadData[15:0];
+
+    wire [31:0] loadDataFinal;
+    assign loadDataFinal =
+        (funct3 == 3'b000) ? {{24{selected_byte[7]}}, selected_byte} : // LB
+        (funct3 == 3'b100) ? {24'b0, selected_byte} :                 // LBU
+        (funct3 == 3'b001) ? {{16{selected_half[15]}}, selected_half} : // LH
+        (funct3 == 3'b101) ? {16'b0, selected_half} :                 // LHU
+        (funct3 == 3'b010) ? ReadData :                               // LW
+                             ReadData;
+
+    wire [31:0] shifted_byte = rs2 << (LoadStoreAddress[1:0] * 8);
+    wire [31:0] shifted_half = rs2 << (LoadStoreAddress[1] * 16);
+
+    wire [3:0] STORE_wmask;
+    assign STORE_wmask =
+        (funct3[1:0] == 2'b00) ? // SB
+            (LoadStoreAddress[1] ?
+                (LoadStoreAddress[0] ? 4'b1000 : 4'b0100) :
+                (LoadStoreAddress[0] ? 4'b0010 : 4'b0001)
+            ) :
+        (funct3[1:0] == 2'b01) ? // SH
+            (LoadStoreAddress[1] ? 4'b1100 : 4'b0011) :
+        4'b1111; // SW
+
+    assign WriteMask = (state == STORE) ? STORE_wmask : 4'b0000;
+
     always @(posedge clk)
         if (reset) begin
             PC    <= 0;
             state <= FETCH_INSTR;
         end else begin
             if (writeBackEn) begin
-                RegisterBank[rdId_A3] <= writeBackData;
+                if (rdId_A3 != 0) RegisterBank[rdId_A3] <= writeBackData;
                 //$display("r%0d <= %b (%d) (%d)",rdId_A3,writeBackData,writeBackData,$signed(writeBackData));
             end
             case(state)
